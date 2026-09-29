@@ -1,0 +1,151 @@
+name: update-cask
+
+on:
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: update-cask
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve the latest datasetop release
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if ! tag=$(gh release view --repo arthuqa/datasetop --json tagName --jq '.tagName' 2>/dev/null); then
+            echo "No release published yet; nothing to do."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          {
+            echo "skip=false"
+            echo "tag=$tag"
+            echo "version=${tag#v}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Download the macOS disk images
+        if: steps.release.outputs.skip == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p assets
+          gh release download "${{ steps.release.outputs.tag }}" \
+            --repo arthuqa/datasetop \
+            --pattern '*_aarch64.dmg' \
+            --pattern '*_x64.dmg' \
+            --dir assets
+          ls -l assets
+
+      - name: Regenerate Casks/datasetop.rb
+        if: steps.release.outputs.skip == 'false'
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+          TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib, os, pathlib, re, sys
+
+          version = os.environ["VERSION"]
+          tag = os.environ["TAG"]
+          assets = sorted(pathlib.Path("assets").iterdir())
+
+          def digest(name):
+              return next((a for a in assets if a.name.endswith(name)), None)
+
+          arm = digest("_aarch64.dmg")
+          intel = digest("_x64.dmg")
+          if not arm and not intel:
+              sys.exit("No macOS disk images found in the release assets")
+
+          def sha256(path):
+              h = hashlib.sha256()
+              with open(path, "rb") as fh:
+                  for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+                      h.update(chunk)
+              return h.hexdigest()
+
+          lines = [
+              'cask "datasetop" do',
+              f'  version "{version}"',
+          ]
+          checksums = []
+          if arm:
+              checksums.append(f'arm: "{sha256(arm)}"')
+          if intel:
+              checksums.append(f'intel: "{sha256(intel)}"')
+          lines.append(f"  sha256 {', '.join(checksums)}")
+          lines.append("")
+          if arm:
+              lines.append("  on_arm do")
+              lines.append('    url "https://github.com/arthuqa/datasetop/releases/download/v#{version}/datasetop_#{version}_aarch64.dmg"')
+              lines.append("  end")
+              lines.append("")
+          if intel:
+              lines.append("  on_intel do")
+              lines.append('    url "https://github.com/arthuqa/datasetop/releases/download/v#{version}/datasetop_#{version}_x64.dmg"')
+              lines.append("  end")
+              lines.append("")
+          lines.append('  name "datasetop"')
+          lines.append('  desc "Chat-first MCP agent for a local folder"')
+          lines.append('  homepage "https://github.com/arthuqa/datasetop"')
+          lines.append("")
+          lines.append("  livecheck do")
+          lines.append('    url "https://github.com/arthuqa/datasetop"')
+          lines.append("    strategy :github_latest")
+          lines.append("  end")
+          lines.append("")
+          lines.append('  depends_on macos: ">= :big_sur"')
+          lines.append("")
+          lines.append('  app "datasetop.app"')
+          lines.append("")
+          lines.append("  caveats <<~EOS")
+          lines.append("    The macOS build is not notarized. If macOS blocks the first launch, run:")
+          lines.append("")
+          lines.append("      xattr -dr com.apple.quarantine /Applications/datasetop.app")
+          lines.append("")
+          lines.append("    or allow it from System Settings -> Privacy & Security -> Open Anyway.")
+          lines.append("  EOS")
+          lines.append("")
+          lines.append("  zap trash: [")
+          lines.append('    "~/Library/Application Support/app.datasetop.desktop",')
+          lines.append('    "~/Library/Caches/app.datasetop.desktop",')
+          lines.append('    "~/Library/Saved Application State/app.datasetop.desktop.savedState",')
+          lines.append("  ]")
+          lines.append("end")
+          lines.append("")
+
+          out = pathlib.Path("Casks/datasetop.rb")
+          out.parent.mkdir(parents=True, exist_ok=True)
+          out.write_text("\n".join(lines))
+          print(out.read_text())
+          PY
+
+      - name: Commit and push
+        if: steps.release.outputs.skip == 'false'
+        env:
+          TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Casks/datasetop.rb
+          if git diff --cached --quiet; then
+            echo "Cask already up to date."
+            exit 0
+          fi
+          git commit -m "datasetop ${TAG}"
+          git push
