@@ -14,18 +14,25 @@ concurrency:
 
 jobs:
   update:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
+      # Reads the public datasetop releases anonymously: the workflow token is
+      # scoped to this repository and cannot see another one.
       - name: Resolve the latest datasetop release
         id: release
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          if ! tag=$(gh release view --repo arthuqa/datasetop --json tagName --jq '.tagName' 2>/dev/null); then
-            echo "No release published yet; nothing to do."
+          api="https://api.github.com/repos/arthuqa/datasetop/releases/latest"
+          if ! json=$(curl -fsSL "$api" 2>/dev/null); then
+            echo "No published datasetop release yet; nothing to do."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          tag=$(printf '%s' "$json" | jq -r '.tag_name')
+          if [ -z "$tag" ] || [ "$tag" = "null" ]; then
+            echo "The latest release has no tag; nothing to do."
             echo "skip=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -38,15 +45,16 @@ jobs:
       - name: Download the macOS disk images
         if: steps.release.outputs.skip == 'false'
         env:
-          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.release.outputs.tag }}
+          VERSION: ${{ steps.release.outputs.version }}
         run: |
           set -euo pipefail
           mkdir -p assets
-          gh release download "${{ steps.release.outputs.tag }}" \
-            --repo arthuqa/datasetop \
-            --pattern '*_aarch64.dmg' \
-            --pattern '*_x64.dmg' \
-            --dir assets
+          base="https://github.com/arthuqa/datasetop/releases/download/${TAG}"
+          for arch in aarch64 x64; do
+            name="datasetop_${VERSION}_${arch}.dmg"
+            curl -fsSL --retry 3 -o "assets/${name}" "${base}/${name}"
+          done
           ls -l assets
 
       - name: Regenerate Casks/datasetop.rb
@@ -57,7 +65,7 @@ jobs:
         run: |
           set -euo pipefail
           python3 - <<'PY'
-          import hashlib, os, pathlib, re, sys
+          import hashlib, os, pathlib, sys
 
           version = os.environ["VERSION"]
           tag = os.environ["TAG"]
@@ -68,8 +76,11 @@ jobs:
 
           arm = digest("_aarch64.dmg")
           intel = digest("_x64.dmg")
-          if not arm and not intel:
-              sys.exit("No macOS disk images found in the release assets")
+          if not arm or not intel:
+              sys.exit("The release is missing one of the two macOS disk images")
+          expected = {f"datasetop_{version}_aarch64.dmg", f"datasetop_{version}_x64.dmg"}
+          if {arm.name, intel.name} != expected:
+              sys.exit(f"Unexpected macOS asset names: {arm.name}, {intel.name}")
 
           def sha256(path):
               h = hashlib.sha256()
@@ -80,53 +91,42 @@ jobs:
 
           lines = [
               'cask "datasetop" do',
+              '  arch arm: "aarch64", intel: "x64"',
+              "",
               f'  version "{version}"',
+              f'  sha256 arm: "{sha256(arm)}",',
+              f'         intel: "{sha256(intel)}"',
+              "",
+              '  url "https://github.com/arthuqa/datasetop/releases/download/v#{version}/datasetop_#{version}_#{arch}.dmg"',
+              '  name "datasetop"',
+              '  desc "Chat-first MCP agent for a local folder"',
+              '  homepage "https://github.com/arthuqa/datasetop"',
+              "",
+              "  livecheck do",
+              '    url "https://github.com/arthuqa/datasetop"',
+              "    strategy :github_latest",
+              "  end",
+              "",
+              '  depends_on macos: ">= :big_sur"',
+              "",
+              '  app "datasetop.app"',
+              "",
+              "  caveats <<~EOS",
+              "    The macOS build is not notarized. If macOS blocks the first launch, run:",
+              "",
+              "      xattr -dr com.apple.quarantine /Applications/datasetop.app",
+              "",
+              "    or allow it from System Settings -> Privacy & Security -> Open Anyway.",
+              "  EOS",
+              "",
+              "  zap trash: [",
+              '    "~/Library/Application Support/app.datasetop.desktop",',
+              '    "~/Library/Caches/app.datasetop.desktop",',
+              '    "~/Library/Saved Application State/app.datasetop.desktop.savedState",',
+              "  ]",
+              "end",
+              "",
           ]
-          checksums = []
-          if arm:
-              checksums.append(f'arm: "{sha256(arm)}"')
-          if intel:
-              checksums.append(f'intel: "{sha256(intel)}"')
-          lines.append(f"  sha256 {', '.join(checksums)}")
-          lines.append("")
-          if arm:
-              lines.append("  on_arm do")
-              lines.append('    url "https://github.com/arthuqa/datasetop/releases/download/v#{version}/datasetop_#{version}_aarch64.dmg"')
-              lines.append("  end")
-              lines.append("")
-          if intel:
-              lines.append("  on_intel do")
-              lines.append('    url "https://github.com/arthuqa/datasetop/releases/download/v#{version}/datasetop_#{version}_x64.dmg"')
-              lines.append("  end")
-              lines.append("")
-          lines.append('  name "datasetop"')
-          lines.append('  desc "Chat-first MCP agent for a local folder"')
-          lines.append('  homepage "https://github.com/arthuqa/datasetop"')
-          lines.append("")
-          lines.append("  livecheck do")
-          lines.append('    url "https://github.com/arthuqa/datasetop"')
-          lines.append("    strategy :github_latest")
-          lines.append("  end")
-          lines.append("")
-          lines.append('  depends_on macos: ">= :big_sur"')
-          lines.append("")
-          lines.append('  app "datasetop.app"')
-          lines.append("")
-          lines.append("  caveats <<~EOS")
-          lines.append("    The macOS build is not notarized. If macOS blocks the first launch, run:")
-          lines.append("")
-          lines.append("      xattr -dr com.apple.quarantine /Applications/datasetop.app")
-          lines.append("")
-          lines.append("    or allow it from System Settings -> Privacy & Security -> Open Anyway.")
-          lines.append("  EOS")
-          lines.append("")
-          lines.append("  zap trash: [")
-          lines.append('    "~/Library/Application Support/app.datasetop.desktop",')
-          lines.append('    "~/Library/Caches/app.datasetop.desktop",')
-          lines.append('    "~/Library/Saved Application State/app.datasetop.desktop.savedState",')
-          lines.append("  ]")
-          lines.append("end")
-          lines.append("")
 
           out = pathlib.Path("Casks/datasetop.rb")
           out.parent.mkdir(parents=True, exist_ok=True)
